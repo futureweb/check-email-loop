@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 #
-my $scriptversion = "1.4.6";
-my $scriptdate = "2018-07-14";
+my $scriptversion = "1.4.7";
+my $scriptdate = "2018-09-27";
 #
 # check_email_loop Nagios Plugin
 #
@@ -91,6 +91,8 @@ my $scriptdate = "2018-07-14";
 # - Add statfile directory parameter ('statfiledir')
 # - Make default statfile directory the script directory (NOT working directory)
 #
+# 2018-09-27 v1.4.7     Andreas Schnederle-Wagner, schnederle@futureweb.at
+# - Add mailsend through SSH Connection (Keychain Auth needed)
 #
 # This software is licensed under the terms and conditions of the GPLv2 license
 #   https://www.gnu.org/licenses/gpl-2.0.html
@@ -135,6 +137,8 @@ my ($subjectident) = ("E-Mail Ping");
 my ($smtpehlo) = (hostfqdn());
 my ($sendmailonly,$sendnomail);
 my ($usesendmail) = ("");
+my ($usessh) = ("");
+my ($sshport) = (22);
 my ($usesmtpssl,$usesmtptls);
 my ($poptimeout,$smtptimeout,$maxmsg)=(60,60,50);
 my ($lostwarn, $lostcrit,$pendwarn, $pendcrit);
@@ -209,6 +213,8 @@ my $status = GetOptions(
 			"sendnomail",\$sendnomail,
 			"sendmailonly",\$sendmailonly,
 			"usesendmail=s",\$usesendmail,
+			"usessh=s",\$usessh,
+			"sshport=i",\$sshport,
 			"usesmtpssl",\$usesmtpssl,
 			"usesmtptls",\$usesmtptls,
 			"subjectident=s",\$subjectident,
@@ -348,7 +354,7 @@ my $maildata = "From: <$sender>\n".
   "It is not intended for a human reader.\n\n".
   "Serial No: $serial\n";
 
-if (!($usesendmail)) {
+if (!($usesendmail) && !($usessh)) {
 module_loader("Net::SMTP");
 my $smtp;
 eval {
@@ -356,7 +362,18 @@ eval {
                $smtpport = $default_smtp_tls_port unless $smtpport;
                $smtp = Net::SMTP->new($smtphost, Timeout=>$smtptimeout, Port=>$smtpport, starttls=>1, Hello=>$smtpehlo, %other_smtp_opts);
                if( $smtp && $smtpuser )  {
-                       $smtp->auth($smtpuser, $smtppasswd);
+       		   		    #print "Sending Mail through SMTP with TLS + AUTH!\n";
+                        #$smtp->auth($smtpuser, $smtppasswd); #not working as it's choosing wrong AUTH Methode ...
+                       	$smtp->datasend("AUTH LOGIN\n") or die 'auth login';  
+						$smtp->response();
+						
+       		   		    #print "User: $smtpuser!\n";
+						$smtp->datasend( encode_base64($smtpuser) ) or die 'username';  
+						$smtp->response();
+						
+       		   		    #print "Pass: $smtppasswd!\n";
+						$smtp->datasend(encode_base64($smtppasswd) ) or die 'password';  
+						$smtp->response();
                }
        }
        elsif( $usesmtpssl ) {
@@ -407,10 +424,21 @@ else {
  $smtp->quit;
 # ) || nsexit("Error delivering message",'CRITICAL');
 } else {
-  open (SENDMAIL,"|$usesendmail -t -f $sender 2>&1") ||
-                 nsexit("SENDMAIL CRITICAL - Using sendmail failed $receiver",'CRITICAL');
-  print SENDMAIL $maildata;
-  close SENDMAIL;
+	if( $usessh && $usesendmail) {
+	   #print "Sending Mail through SSH Connection from $smtphost!\n";
+	   #print "\n\n$maildata\n\n";
+	   open (SSHCON,"|source /home/icinga/.keychain/icinga.futureweb.at-sh 2>&1;/usr/bin/ssh -p$sshport root\@$smtphost '$usesendmail -t -f $sender' 2>&1") ||
+	   	                 nsexit("SENDMAIL CRITICAL - Using sendmail failed $receiver",'CRITICAL');
+	  print SSHCON $maildata;
+	  close SSHCON;
+	} else {
+	  #print "Sending Mail with local Sendmail!\n";
+	  #print "\n\n$maildata\n\n";
+	  open (SENDMAIL,"|$usesendmail -t -f $sender 2>&1") ||
+	                 nsexit("SENDMAIL CRITICAL - Using sendmail failed $receiver",'CRITICAL');
+	  print SENDMAIL $maildata;
+	  close SENDMAIL;
+	}
 }
 
  if (defined($sendmailonly)) {
@@ -489,6 +517,8 @@ sub usage {
   print "   -usesmtpssl        Set this to login with ssl enabled on smtp server\n";
   print "   -usesmtptls        Set this to login with tls enabled on smtp server\n";
   print "   -usesendmail=text  Use a sendmail binary (/usr/sbin/sendmail) instead of a SMTP server\n";
+  print "   -usessh=text       Use a sendmail binary over SSH Connection (/usr/sbin/sendmail) instead of a SMTP server\n";
+  print "   -sshport=num       SSH Port\n";
   print "   -statfile=text     File to save ids of messages ($statfile)\n";
   print "   -statfilename=text Similar like -statfile but add no hash to the filename\n";
   print "   -statfiledir=text  Absolute path of directory for the statfile (default is script directory NOT working directory)\n";
@@ -553,10 +583,17 @@ sub messagematchsid {
   my (@tmp);
   my $match = 0;
 
+#printd ("-----------------mailref    : $mailref\n");
+
   # ID
   $id =~ s/^LI/ID/;    # evtl. remove lost mail mark
   @tmp = grep /$subjectident \[/, @$mailref;
+
+
   chomp @tmp;
+  
+#printd ("-----------------tmp    : $tmp[0]	\n");
+
   if (defined($tmp[0])) {
 	printd ("Comparing Mail content ".$tmp[0]." with Mail ID: ".$id." \n");
   } else {
@@ -600,7 +637,7 @@ sub doPop {
 	if (defined $usessl) { printd ("Retrieving POP mails from $pophost using ssl and user: $popuser and password $poppasswd\n"); }
 	else { printd ("Retrieving POP mails from $pophost using user: $popuser and password $poppasswd\n"); }
 
-	# no the interessting part: let's if they are receiving ;-)
+	# now the interessting part: let's if they are receiving ;-)
 
 	$pop = Mail::POP3Client->new( HOST => $pophost,
 		TIMEOUT => $poptimeout,
